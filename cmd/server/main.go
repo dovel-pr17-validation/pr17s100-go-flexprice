@@ -1,0 +1,922 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/flexprice/flexprice/internal/activity"
+	"github.com/flexprice/flexprice/internal/api"
+	adminapi "github.com/flexprice/flexprice/internal/api/admin"
+	adminv1 "github.com/flexprice/flexprice/internal/api/admin/v1"
+	v1 "github.com/flexprice/flexprice/internal/api/v1"
+	"github.com/flexprice/flexprice/internal/buildinfo"
+	"github.com/flexprice/flexprice/internal/cache"
+	"github.com/flexprice/flexprice/internal/clickhouse"
+	"github.com/flexprice/flexprice/internal/config"
+	"github.com/flexprice/flexprice/internal/dynamodb"
+	"github.com/flexprice/flexprice/internal/ee/analytics"
+	"github.com/flexprice/flexprice/internal/ee/auth/saml"
+	"github.com/flexprice/flexprice/internal/ee/service"
+	accountingperiodsvc "github.com/flexprice/flexprice/internal/ee/service/accountingperiod"
+	adminsvc "github.com/flexprice/flexprice/internal/ee/service/admin"
+	contractsvc "github.com/flexprice/flexprice/internal/ee/service/contract"
+	journalsvc "github.com/flexprice/flexprice/internal/ee/service/journal"
+	pobsvc "github.com/flexprice/flexprice/internal/ee/service/pob"
+	"github.com/flexprice/flexprice/internal/ee/service/revenue"
+	revenuereportsvc "github.com/flexprice/flexprice/internal/ee/service/revenuereport"
+	"github.com/flexprice/flexprice/internal/ee/service/selfbilling"
+	"github.com/flexprice/flexprice/internal/httpclient"
+	integrationevents "github.com/flexprice/flexprice/internal/integration/events"
+	"github.com/flexprice/flexprice/internal/kafka"
+	"github.com/flexprice/flexprice/internal/logger"
+	"github.com/flexprice/flexprice/internal/pdf"
+	"github.com/flexprice/flexprice/internal/postgres"
+	"github.com/flexprice/flexprice/internal/publisher"
+	kafkaPubsub "github.com/flexprice/flexprice/internal/pubsub/kafka"
+	pubsubRouter "github.com/flexprice/flexprice/internal/pubsub/router"
+	"github.com/flexprice/flexprice/internal/pyroscope"
+	"github.com/flexprice/flexprice/internal/rbac"
+	"github.com/flexprice/flexprice/internal/repository"
+	"github.com/flexprice/flexprice/internal/storage"
+	"github.com/flexprice/flexprice/internal/svix"
+	"github.com/flexprice/flexprice/internal/telemetry"
+	"github.com/flexprice/flexprice/internal/temporal"
+	"github.com/flexprice/flexprice/internal/temporal/client"
+	"github.com/flexprice/flexprice/internal/temporal/models"
+	"github.com/flexprice/flexprice/internal/temporal/queries"
+	temporalservice "github.com/flexprice/flexprice/internal/temporal/service"
+	"github.com/flexprice/flexprice/internal/temporal/worker"
+	"github.com/flexprice/flexprice/internal/tracing"
+	"github.com/flexprice/flexprice/internal/types"
+	"github.com/flexprice/flexprice/internal/typst"
+	"github.com/flexprice/flexprice/internal/validator"
+	"github.com/flexprice/flexprice/internal/webhook"
+	"go.uber.org/fx"
+
+	_ "github.com/flexprice/flexprice/docs/swagger"
+	"github.com/flexprice/flexprice/internal/domain/environment"
+	"github.com/flexprice/flexprice/internal/domain/incomingwebhookevent"
+	"github.com/flexprice/flexprice/internal/domain/proration"
+	"github.com/flexprice/flexprice/internal/domain/user"
+	syncExport "github.com/flexprice/flexprice/internal/ee/service/sync/export"
+	"github.com/flexprice/flexprice/internal/integration"
+	"github.com/flexprice/flexprice/internal/interfaces"
+	"github.com/flexprice/flexprice/internal/security"
+	"github.com/gin-gonic/gin"
+	"github.com/nedpals/supabase-go"
+)
+
+// @title Flexprice API
+// @version 1.0
+// @description Flexprice API provides billing, metering, and subscription management for SaaS and usage-based products. Use it to manage customers, plans, invoices, payments, usage events, and entitlements. Authenticate with an API key in the x-api-key header.
+// @contact.name API Support
+// @license.name AGPL-3.0
+// @license.url https://www.gnu.org/licenses/agpl-3.0.html
+// @description Flexprice API Service
+// @BasePath /v1
+// @schemes http https
+// @securityDefinitions.apikey ApiKeyAuth
+// @in header
+// @name x-api-key
+// @description Enter your API key in the format *x-api-key &lt;api-key&gt;**
+
+func init() {
+	// Set UTC timezone for the entire application
+	time.Local = time.UTC
+}
+
+func main() {
+	// Initialize Fx application
+	var opts []fx.Option
+
+	// Core dependencies
+	opts = append(opts,
+		fx.Provide(
+			// Validator
+			validator.NewValidator,
+
+			// Config — validated at boot (fail-fast for non-local deployments)
+			config.NewValidatedConfig,
+
+			// Logger
+			logger.NewLogger,
+
+			// Security
+			security.NewEncryptionService,
+
+			// RBAC
+			rbac.NewRBACService,
+
+			// Monitoring
+			tracing.NewService,
+			pyroscope.NewPyroscopeService,
+			telemetry.NewReporter,
+
+			// Cache
+			cache.InitializeInMemoryCache,
+			cache.NewRedisCache,
+			cache.NewRedisLocker,
+
+			// Postgres
+			postgres.NewEntClients,
+			postgres.NewClient,
+
+			// Clickhouse
+			clickhouse.NewClickHouseStore,
+
+			// Typst
+			typst.DefaultCompiler,
+
+			// Pdf generation
+			pdf.NewGenerator,
+
+			// Optional DBs
+			dynamodb.NewClient,
+
+			// Producers and Consumers
+			kafka.NewProducer,
+			kafka.NewSecondaryProducer,
+			analytics.NewMeterUsageSinkPublisher,
+			kafka.NewConsumer,
+
+			// Event Publisher
+			publisher.NewEventPublisher,
+
+			// HTTP Client
+			httpclient.NewDefaultClient,
+
+			// Svix
+			svix.NewClient,
+
+			// Repositories
+			repository.NewEventRepository,
+			repository.NewProcessedEventRepository,
+			repository.NewMeterUsageRepository,
+			repository.NewActivityRepository,
+			repository.NewMeterRepository,
+			repository.NewUserRepository,
+			repository.NewAuthRepository,
+			repository.NewPriceRepository,
+			repository.NewCustomerRepository,
+			repository.NewPlanRepository,
+			repository.NewPlanPriceSyncRepository,
+			repository.NewAddonPriceSyncRepository,
+			repository.NewSubscriptionRepository,
+			repository.NewWalletRepository,
+			repository.NewTenantRepository,
+			repository.NewEnvironmentRepository,
+			repository.NewInvoiceRepository,
+			repository.NewInvoiceLineItemRepository,
+			repository.NewFeatureRepository,
+			repository.NewEntitlementRepository,
+			repository.NewEntitlementGrantRepository,
+			repository.NewMeterUsageCheckpointRepository,
+			repository.NewCommitmentRepository,
+			repository.NewPaymentRepository,
+			repository.NewPaymentMethodRepository,
+			repository.NewRefundRepository,
+			repository.NewTaskRepository,
+			repository.NewTaxAppliedRepository,
+			repository.NewSecretRepository,
+			repository.NewCreditGrantRepository,
+			repository.NewCostsheetRepository,
+			repository.NewCreditGrantApplicationRepository,
+			repository.NewCreditNoteRepository,
+			repository.NewCreditNoteLineItemRepository,
+			repository.NewConnectionRepository,
+			repository.NewEntityIntegrationMappingRepository,
+			repository.NewUsageRecordRepository,
+			repository.NewTaxRateRepository,
+			repository.NewFXRateRepository,
+			repository.NewHostedInvoiceTokenRepository,
+			repository.NewTaxAssociationRepository,
+			repository.NewCouponRepository,
+			repository.NewCouponAssociationRepository,
+			repository.NewCouponApplicationRepository,
+			repository.NewAddonRepository,
+			repository.NewProductRepository,
+			repository.NewContractRepository,
+			repository.NewPerformanceObligationRepository,
+			repository.NewAccountingPeriodRepository,
+			repository.NewJournalRepository,
+			repository.NewAddonAssociationRepository,
+			repository.NewSubscriptionLineItemRepository,
+			repository.NewSubscriptionPhaseRepository,
+			repository.NewSubscriptionScheduleRepository,
+			repository.NewSettingsRepository,
+			repository.NewAlertLogsRepository,
+			repository.NewAlertSettingsRepository,
+			repository.NewIncomingWebhookEventRepository,
+			repository.NewSystemEventRepository,
+			repository.NewSystemEventDomainRepository,
+			repository.NewGroupRepository,
+			repository.NewScheduledTaskRepository,
+			repository.NewPriceUnitRepository,
+			repository.NewWorkflowExecutionRepository,
+			repository.NewCheckoutSessionRepository,
+			repository.NewRawEventRepository,
+			repository.NewAnalyticsViewRepository,
+			repository.NewReportsRepository,
+			repository.NewRevenueFactRepository,
+			repository.NewSelfBillingClickHouseRepository,
+			repository.NewSelfBillingPostgresRepository,
+			repository.NewEventDeletionRequestRepository,
+			repository.NewEventDeletionLogRepository,
+
+			// PubSub
+			pubsubRouter.NewRouter,
+
+			// Proration
+			proration.NewCalculator,
+		),
+	)
+
+	// Webhook module (must be initialised before services)
+	opts = append(opts, webhook.Module)
+
+	// Integration events module — isolated consumer group on system_events topic (webhook-shaped events).
+	opts = append(opts, integrationevents.Module)
+
+	// Provide Wallet Balance Alert PubSub
+	opts = append(opts,
+		fx.Provide(
+			provideWalletBalanceAlertPubSub,
+		),
+	)
+
+	// Activity log capture (hook, publisher); inert unless activity.enabled
+	opts = append(opts,
+		fx.Provide(
+			provideActivityPubSub,
+			activity.Registrations,
+			activity.NewPublisher,
+			activity.NewLinkedCustomers,
+			activity.NewConsumer,
+		),
+	)
+
+	// Service layer
+	opts = append(opts,
+		serviceParamsProviders(),
+		fx.Provide(
+			// Services
+			// Integration factory must be provided before service params
+			integration.NewFactory,
+			// Storage resolver — cloud-agnostic Storage for platform-owned buckets
+			// (invoices/exports/imports). Provided before service params so any
+			// service can reach it via ServiceParams.StorageResolver.
+			provideStorageResolver,
+			syncExport.NewExportService,
+			fx.Annotate(service.NewServiceParams, fx.ResultTags(`name:"base"`)),
+			service.NewOAuthService,
+			service.NewTenantService,
+			service.NewAuthService,
+			provideSupabaseClient,
+			service.NewUserService,
+			service.NewEnvAccessService,
+			service.NewEnvironmentService,
+			adminsvc.NewEnvironmentService,
+			adminsvc.NewTenantService,
+			adminsvc.NewUserService,
+			adminsvc.NewSettingsService,
+			adminsvc.NewDLQService,
+			adminsvc.NewRevenueRecognitionService,
+			service.NewMeterService,
+			service.NewEventService,
+			service.NewEventDeletionWindowService,
+			service.NewEventConsumptionService,
+			service.NewRawEventsReprocessingService,
+			service.NewRawEventConsumptionService,
+			service.NewCostSheetUsageTrackingService,
+			service.NewMeterUsageTrackingService,
+			service.NewMeterUsageService,
+			service.NewEventDeletionService,
+			service.NewCheckoutSessionService,
+			service.NewPriceService,
+			service.NewPriceUnitService,
+			service.NewCustomerService,
+			service.NewPlanService,
+			service.NewSubscriptionService,
+			service.NewSubscriptionPhaseService,
+			service.NewWalletService,
+			service.NewInvoiceService,
+			service.NewFeatureService,
+			service.NewActivityService,
+			service.NewEntitlementService,
+			service.NewEntitlementGrantService,
+			service.NewPaymentService,
+			service.NewPaymentProcessorService,
+			service.NewTaskService,
+			service.NewSecretService,
+			service.NewOnboardingService,
+			service.NewGeminiPricingService,
+			service.NewBillingService,
+			service.NewCreditGrantService,
+			service.NewCostsheetService,
+			service.NewRevenueAnalyticsService,
+			service.NewCreditNoteService,
+			service.NewRefundService,
+			service.NewConnectionService,
+			service.NewMarketplaceService,
+			service.NewUsageRecordService,
+			service.NewEntityIntegrationMappingService,
+			service.NewIntegrationSyncService,
+			service.NewTaxService,
+			service.NewFXRateService,
+			service.NewHostedInvoiceTokenService,
+			service.NewHostedInvoiceService,
+			service.NewCouponService,
+			service.NewCommitmentService,
+			service.NewCouponAssociationService,
+			service.NewAddonService,
+			service.NewProductService,
+			contractsvc.NewContractService,
+			pobsvc.NewPerformanceObligationService,
+			accountingperiodsvc.NewAccountingPeriodService,
+			journalsvc.NewJournalService,
+			revenuereportsvc.NewRevenueReportService,
+			service.NewSettingsService,
+			service.NewSubscriptionChangeService,
+			service.NewSubscriptionModificationService,
+			service.NewSubscriptionScheduleService,
+			service.NewAlertLogsService,
+			service.NewAlertService,
+			service.NewGroupService,
+			service.NewScheduledTaskService,
+			service.NewWalletPaymentService,
+			service.NewWalletBalanceAlertService,
+			service.NewCustomerPortalService,
+			service.NewDashboardService,
+			service.NewWorkflowExecutionService,
+			service.NewWorkflowService,
+			service.NewAnalyticsService,
+		),
+	)
+
+	// API layer
+	opts = append(opts,
+		fx.Provide(
+			// Temporal components
+			provideTemporalConfig,
+			provideTemporalClient,
+			provideTemporalWorkerManager,
+			provideTemporalService,
+			provideWorkflowQuerier,
+
+			// API components
+			provideHandlers,
+			provideRouter,
+			provideAdminHandlers,
+			provideAdminRouter,
+		),
+		fx.Invoke(
+			tracing.RegisterHooks,
+			repository.InitTracing,
+			pyroscope.RegisterHooks,
+			telemetry.RegisterHooks,
+			activity.Install,
+			initIntegrationFactory,
+			startServer,
+		),
+	)
+	opts = append(opts, fx.StartTimeout(3*time.Minute), fx.StopTimeout(config.ServerStopTimeout))
+	app := fx.New(opts...)
+	app.Run()
+}
+
+func provideHandlers(
+	cfg *config.Configuration,
+	logger *logger.Logger,
+	serviceParams service.ServiceParams,
+	redisCache cache.RedisCache,
+	meterService service.MeterService,
+	eventService service.EventService,
+	environmentService service.EnvironmentService,
+	authService service.AuthService,
+	userService service.UserService,
+	priceService service.PriceService,
+	priceUnitService service.PriceUnitService,
+	customerService service.CustomerService,
+	planService service.PlanService,
+	subscriptionService service.SubscriptionService,
+	walletService service.WalletService,
+	tenantService service.TenantService,
+	invoiceService service.InvoiceService,
+	temporalService temporalservice.TemporalService,
+	featureService service.FeatureService,
+	activityService service.ActivityService,
+	entitlementService service.EntitlementService,
+	paymentService service.PaymentService,
+	paymentProcessorService service.PaymentProcessorService,
+	taskService service.TaskService,
+	secretService service.SecretService,
+	onboardingService service.OnboardingService,
+	billingService service.BillingService,
+	creditGrantService service.CreditGrantService,
+	costsheetService service.CostsheetService,
+	revenueAnalyticsService service.RevenueAnalyticsService,
+	creditNoteService service.CreditNoteService,
+	refundService service.RefundService,
+	connectionService service.ConnectionService,
+	marketplaceService service.MarketplaceService,
+	usageRecordService service.UsageRecordService,
+	entityIntegrationMappingService service.EntityIntegrationMappingService,
+	integrationSyncService service.IntegrationSyncService,
+	svixClient *svix.Client,
+	taxService service.TaxService,
+	fxRateService service.FXRateService,
+	couponService service.CouponService,
+	commitmentService service.CommitmentService,
+	couponAssociationService service.CouponAssociationService,
+	addonService service.AddonService,
+	productService service.ProductService,
+	contractService contractsvc.ContractService,
+	pobService pobsvc.PerformanceObligationService,
+	accountingPeriodService accountingperiodsvc.AccountingPeriodService,
+	journalService journalsvc.JournalService,
+	revenueReportService revenuereportsvc.RevenueReportService,
+	settingsService service.SettingsService,
+	subscriptionChangeService service.SubscriptionChangeService,
+	subscriptionModificationService service.SubscriptionModificationService,
+	subscriptionScheduleService service.SubscriptionScheduleService,
+	rawEventsReprocessingService service.RawEventsReprocessingService,
+	rawEventConsumptionService service.RawEventConsumptionService,
+	alertLogsService service.AlertLogsService,
+	alertService service.AlertService,
+	groupService service.GroupService,
+	integrationFactory *integration.Factory,
+	db postgres.IClient,
+	scheduledTaskService service.ScheduledTaskService,
+	rbacService *rbac.RBACService,
+	oauthService service.OAuthService,
+	costsheetUsageTrackingService service.CostSheetUsageTrackingService,
+	customerPortalService service.CustomerPortalService,
+	hostedInvoiceService service.HostedInvoiceService,
+	dashboardService service.DashboardService,
+	workflowService service.WorkflowService,
+	meterUsageService service.MeterUsageService,
+	eventDeletionService service.EventDeletionService,
+	checkoutSessionService service.CheckoutSessionService,
+	geminiPricingService service.GeminiPricingService,
+	webhookService *webhook.WebhookService,
+	analyticsService service.AnalyticsService,
+	revenueService interfaces.RevenueService,
+	selfBillingService selfbilling.Service,
+) api.Handlers {
+	return api.Handlers{
+		Events:                   v1.NewEventsHandler(eventService, rawEventsReprocessingService, rawEventConsumptionService, meterUsageService, eventDeletionService, cfg, logger),
+		Meter:                    v1.NewMeterHandler(meterService, logger),
+		Auth:                     v1.NewAuthHandler(cfg, authService, logger),
+		User:                     v1.NewUserHandler(userService, logger),
+		Environment:              v1.NewEnvironmentHandler(environmentService, logger),
+		Health:                   v1.NewHealthHandler(logger),
+		Price:                    v1.NewPriceHandler(priceService, logger),
+		PriceUnit:                v1.NewPriceUnitHandler(priceUnitService, logger),
+		Customer:                 v1.NewCustomerHandler(customerService, billingService, paymentService, entityIntegrationMappingService, logger),
+		Plan:                     v1.NewPlanHandler(planService, entitlementService, creditGrantService, temporalService, cfg, logger),
+		Subscription:             v1.NewSubscriptionHandler(subscriptionService, logger),
+		SubscriptionPause:        v1.NewSubscriptionPauseHandler(subscriptionService, logger),
+		SubscriptionChange:       v1.NewSubscriptionChangeHandler(subscriptionChangeService, logger),
+		SubscriptionModification: v1.NewSubscriptionModificationHandler(subscriptionModificationService, logger),
+		InvoiceModification:      v1.NewInvoiceModificationHandler(invoiceService, logger),
+		SubscriptionSchedule:     v1.NewSubscriptionScheduleHandler(subscriptionScheduleService),
+		Wallet:                   v1.NewWalletHandler(walletService, logger),
+		Tenant:                   v1.NewTenantHandler(tenantService, logger),
+		Invoice:                  v1.NewInvoiceHandler(invoiceService, cfg, logger),
+		Feature:                  v1.NewFeatureHandler(featureService, logger),
+		Activity:                 v1.NewActivityHandler(activityService, logger),
+		Entitlement:              v1.NewEntitlementHandler(entitlementService, logger),
+		Payment:                  v1.NewPaymentHandler(paymentService, paymentProcessorService, logger),
+		Task:                     v1.NewTaskHandler(taskService, temporalService, logger),
+		Secret:                   v1.NewSecretHandler(secretService, logger),
+		Tax:                      v1.NewTaxHandler(taxService, logger),
+		FXRate:                   v1.NewFXRateHandler(fxRateService, logger),
+		Onboarding:               v1.NewOnboardingHandler(onboardingService, logger),
+		AIPricing:                v1.NewAIPricingHandler(geminiPricingService, logger),
+		CreditGrant:              v1.NewCreditGrantHandler(creditGrantService, logger),
+		Costsheet:                v1.NewCostsheetHandler(costsheetService, logger),
+		RevenueAnalytics:         v1.NewRevenueAnalyticsHandler(revenueAnalyticsService, costsheetUsageTrackingService, cfg, logger),
+		CreditNote:               v1.NewCreditNoteHandler(creditNoteService, logger),
+		Refund:                   v1.NewRefundHandler(refundService, logger),
+		Connection:               v1.NewConnectionHandler(connectionService, logger),
+		Marketplace:              v1.NewMarketplaceHandler(marketplaceService, logger),
+		UsageRecord:              v1.NewUsageRecordHandler(usageRecordService, logger),
+		Integration:              v1.NewIntegrationHandler(integrationSyncService, entityIntegrationMappingService, connectionService, logger),
+		Paddle:                   v1.NewPaddleHandler(integrationFactory, logger),
+		Webhook:                  v1.NewWebhookHandler(cfg, svixClient, logger, integrationFactory, customerService, paymentService, invoiceService, planService, subscriptionService, entityIntegrationMappingService, checkoutSessionService, refundService, db, webhookService),
+		Coupon:                   v1.NewCouponHandler(couponService, couponAssociationService, logger),
+		Addon:                    v1.NewAddonHandler(addonService, entitlementService, temporalService, logger),
+		Product:                  v1.NewProductHandler(productService, logger),
+		Contract:                 v1.NewContractHandler(contractService, logger),
+		PerformanceObligation:    v1.NewPerformanceObligationHandler(pobService, logger),
+		AccountingPeriod:         v1.NewAccountingPeriodHandler(accountingPeriodService, logger),
+		JournalEntry:             v1.NewJournalEntryHandler(journalService, logger),
+		RevenueReport:            v1.NewRevenueReportHandler(revenueReportService, logger),
+		Commitment:               v1.NewCommitmentHandler(commitmentService, logger),
+		Settings:                 v1.NewSettingsHandler(settingsService, logger),
+		SetupIntent:              v1.NewSetupIntentHandler(integrationFactory, customerService, cfg, logger),
+		Group:                    v1.NewGroupHandler(groupService, logger),
+		ScheduledTask:            v1.NewScheduledTaskHandler(scheduledTaskService, logger),
+		AlertLogsHandler:         v1.NewAlertLogsHandler(alertLogsService, customerService, walletService, featureService, logger),
+		AlertSettingsHandler:     v1.NewAlertSettingsHandler(alertService, logger),
+		RBAC:                     v1.NewRBACHandler(rbacService, userService, logger),
+		OAuth:                    v1.NewOAuthHandler(oauthService, cfg.OAuth.RedirectURI, logger),
+		CustomerPortal:           v1.NewCustomerPortalHandler(customerPortalService, logger),
+		SelfBilling:              v1.NewSelfBillingHandler(selfBillingService),
+		HostedInvoice:            v1.NewHostedInvoiceHandler(hostedInvoiceService, logger),
+		Dashboard:                v1.NewDashboardHandler(dashboardService, logger),
+		Workflow:                 v1.NewWorkflowHandler(workflowService, logger),
+		MeterUsage:               v1.NewMeterUsageHandler(meterUsageService, logger),
+		SAML:                     saml.NewHandler(cfg, serviceParams, logger),
+		CheckoutSession:          v1.NewCheckoutSessionHandler(checkoutSessionService, logger),
+		Analytics:                v1.NewAnalyticsHandler(analyticsService, revenueService, logger),
+	}
+}
+
+func provideAdminHandlers(
+	environments adminsvc.EnvironmentService,
+	tenants adminsvc.TenantService,
+	users adminsvc.UserService,
+	settings adminsvc.SettingsService,
+	dlq adminsvc.DLQService,
+	revenueRecognition adminsvc.RevenueRecognitionService,
+) adminapi.Handlers {
+	return adminapi.Handlers{
+		Health:             adminv1.NewHealthHandler(),
+		Me:                 adminv1.NewMeHandler(),
+		Environment:        adminv1.NewEnvironmentHandler(environments),
+		Tenant:             adminv1.NewTenantHandler(tenants),
+		User:               adminv1.NewUserHandler(users),
+		Settings:           adminv1.NewSettingsHandler(settings),
+		DLQ:                adminv1.NewDLQHandler(dlq),
+		RevenueRecognition: adminv1.NewRevenueRecognitionHandler(revenueRecognition),
+	}
+}
+
+func provideAdminRouter(handlers adminapi.Handlers, log *logger.Logger, cfg *config.Configuration) (*adminapi.Server, error) {
+	if cfg.Deployment.Mode == types.ModeAdmin && strings.TrimSpace(cfg.Admin.Secret) == "" {
+		return nil, fmt.Errorf("admin mode requires admin.secret (FLEXPRICE_ADMIN_SECRET)")
+	}
+	return adminapi.NewRouter(handlers, log, cfg.Admin.Secret), nil
+}
+
+func provideRouter(
+	handlers api.Handlers,
+	cfg *config.Configuration,
+	logger *logger.Logger,
+	secretService service.SecretService,
+	envAccessService service.EnvAccessService,
+	rbacService *rbac.RBACService,
+	tenantService service.TenantService,
+	webhookRequestRepo incomingwebhookevent.Repository,
+	environmentRepo environment.Repository,
+	userRepo user.Repository,
+	hostedInvoiceService service.HostedInvoiceService,
+) *gin.Engine {
+	return api.NewRouter(
+		handlers,
+		cfg,
+		logger,
+		secretService,
+		envAccessService,
+		rbacService,
+		tenantService,
+		webhookRequestRepo,
+		environmentRepo,
+		userRepo,
+		hostedInvoiceService,
+	)
+}
+
+func initIntegrationFactory(factory *integration.Factory, paymentService interfaces.PaymentService, invoiceService service.InvoiceService) {
+	factory.SetServices(paymentService, invoiceService)
+}
+
+// provideStorageResolver constructs the platform storage resolver at boot.
+// The resolver runs CloudDetector once (which blocks on metadata probes), so
+// a background context is used deliberately — this must not be per-request.
+// Factory is passed as ConnectionStorageProvider so ForConnection can resolve
+// customer BYOB buckets from the connection row.
+func provideStorageResolver(cfg *config.Configuration, log *logger.Logger, factory *integration.Factory) storage.Resolver {
+	return storage.NewResolver(context.Background(), cfg, factory, log)
+}
+
+func provideSupabaseClient(cfg *config.Configuration) *supabase.Client {
+	if cfg == nil || cfg.Auth.Supabase.BaseURL == "" || cfg.Auth.Supabase.ServiceKey == "" {
+		return nil
+	}
+	return supabase.CreateClient(cfg.Auth.Supabase.BaseURL, cfg.Auth.Supabase.ServiceKey)
+}
+
+func provideTemporalConfig(cfg *config.Configuration) *config.TemporalConfig {
+	return &cfg.Temporal
+}
+
+func provideTemporalClient(cfg *config.TemporalConfig, log *logger.Logger, tracingSvc *tracing.Service) (client.TemporalClient, error) {
+	log.Info(context.Background(), "Initializing Temporal client", "address", cfg.Address, "namespace", cfg.Namespace)
+
+	// Use default options and merge with config
+	options := models.DefaultClientOptions()
+	if cfg.Address != "" {
+		options.Address = cfg.Address
+	}
+	if cfg.Namespace != "" {
+		options.Namespace = cfg.Namespace
+	}
+	if cfg.APIKey != "" {
+		options.APIKey = cfg.APIKey
+	}
+	options.TLS = cfg.TLS
+	options.MetricsHandler = tracingSvc.TemporalMetricsHandler()
+
+	// Create temporal client directly
+	temporalClient, err := client.NewTemporalClient(options, log)
+	if err != nil {
+		log.Error(context.Background(), "Failed to create Temporal client", "error", err)
+		return nil, fmt.Errorf("failed to create temporal client: %w", err)
+	}
+
+	log.Info(context.Background(), "Temporal client created successfully")
+	return temporalClient, nil
+}
+
+func provideTemporalWorkerManager(temporalClient client.TemporalClient, log *logger.Logger) worker.TemporalWorkerManager {
+	return worker.NewTemporalWorkerManager(temporalClient, log)
+}
+
+func provideTemporalService(temporalClient client.TemporalClient, workerManager worker.TemporalWorkerManager, log *logger.Logger, tracingSvc *tracing.Service, cfg *config.TemporalConfig) temporalservice.TemporalService {
+	temporalservice.InitializeGlobalTemporalService(temporalClient, workerManager, log, tracingSvc, cfg)
+	return temporalservice.GetGlobalTemporalService()
+}
+
+func provideWorkflowQuerier(temporalClient client.TemporalClient, log *logger.Logger) *queries.WorkflowQuerier {
+	return queries.NewWorkflowQuerier(temporalClient.GetRawClient(), log)
+}
+
+func startServer(
+	lc fx.Lifecycle,
+	cfg *config.Configuration,
+	r *gin.Engine,
+	adminRouter *adminapi.Server,
+	consumer kafka.MessageConsumer,
+	temporalClient client.TemporalClient,
+	temporalService temporalservice.TemporalService,
+	webhookService *webhook.WebhookService,
+	integrationEventService *integrationevents.IntegrationEventService,
+	router *pubsubRouter.Router,
+	onboardingService service.OnboardingService,
+	log *logger.Logger,
+	eventConsumptionSvc service.EventConsumptionService,
+	costSheetUsageSvc service.CostSheetUsageTrackingService,
+	walletBalanceAlertSvc service.WalletBalanceAlertService,
+	rawEventConsumptionSvc service.RawEventConsumptionService,
+	meterUsageTrackingSvc service.MeterUsageTrackingService,
+	activityConsumer *activity.Consumer,
+	params service.ServiceParams,
+) {
+	mode := cfg.Deployment.Mode
+	if mode == "" {
+		mode = types.ModeLocal
+	}
+
+	log.Infow("starting flexprice", "mode", mode, "version", buildinfo.Version, "git_sha", buildinfo.GitSHA)
+
+	switch mode {
+	case types.ModeLocal:
+		if consumer == nil {
+			log.Fatal(context.Background(), "Kafka consumer required for local mode")
+		}
+		// Register all handlers and start router once
+		registerRouterHandlers(router, webhookService, integrationEventService, onboardingService, eventConsumptionSvc, costSheetUsageSvc, walletBalanceAlertSvc, rawEventConsumptionSvc, meterUsageTrackingSvc, activityConsumer, cfg, true)
+		startRouter(lc, router, log)
+		startTemporalWorker(lc, log, temporalClient, temporalService, params, webhookService)
+
+		// Registered last so fx's reverse-order stop drains HTTP before deps close.
+		startAPIServer(lc, r, cfg, log)
+	case types.ModeAPI:
+		// Register all handlers and start router once (no event consumption)
+		registerRouterHandlers(router, webhookService, integrationEventService, onboardingService, eventConsumptionSvc, costSheetUsageSvc, walletBalanceAlertSvc, rawEventConsumptionSvc, meterUsageTrackingSvc, activityConsumer, cfg, false)
+		startRouter(lc, router, log)
+
+		// Registered last so fx's reverse-order stop drains HTTP before deps close.
+		startAPIServer(lc, r, cfg, log)
+
+	case types.ModeTemporalWorker:
+		// Register webhook handler and start router so that webhook events
+		// published by temporal activities (e.g. invoice finalization) are
+		// consumed and delivered via Svix/native in the same process.
+		registerRouterHandlers(router, webhookService, integrationEventService, onboardingService, eventConsumptionSvc, costSheetUsageSvc, walletBalanceAlertSvc, rawEventConsumptionSvc, meterUsageTrackingSvc, activityConsumer, cfg, false)
+		startRouter(lc, router, log)
+		startTemporalWorker(lc, log, temporalClient, temporalService, params, webhookService)
+	case types.ModeConsumer:
+		if consumer == nil {
+			log.Fatal(context.Background(), "Kafka consumer required for consumer mode")
+		}
+
+		// Register all handlers and start router once
+		registerRouterHandlers(router, webhookService, integrationEventService, onboardingService, eventConsumptionSvc, costSheetUsageSvc, walletBalanceAlertSvc, rawEventConsumptionSvc, meterUsageTrackingSvc, activityConsumer, cfg, true)
+		startRouter(lc, router, log)
+	case types.ModeAdmin:
+		startAPIServer(lc, adminRouter, cfg, log)
+	default:
+		log.Fatalf("Unknown deployment mode: %s", mode)
+	}
+}
+
+func startTemporalWorker(
+	lc fx.Lifecycle,
+	log *logger.Logger,
+	temporalClient client.TemporalClient,
+	temporalService temporalservice.TemporalService,
+	params service.ServiceParams,
+	webhookService *webhook.WebhookService,
+) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) (err error) {
+			if err = temporalService.Start(ctx); err != nil {
+				return fmt.Errorf("start temporal service: %w", err)
+			}
+			defer func() {
+				if err == nil {
+					return
+				}
+				if stopErr := temporalService.Stop(ctx); stopErr != nil {
+					log.Error(ctx, "Failed to stop Temporal service after startup failure", "error", stopErr)
+				}
+			}()
+
+			if err := temporalservice.EnsureSchedules(ctx, temporalClient, log); err != nil {
+				return fmt.Errorf("ensure temporal server schedules: %w", err)
+			}
+
+			// Register workflows and activities first (this creates the workers)
+			if err := temporal.RegisterWorkflowsAndActivities(temporalService, params, webhookService); err != nil {
+				return fmt.Errorf("failed to register workflows and activities: %w", err)
+			}
+
+			// Start workers for all task queues
+			for _, taskQueue := range types.GetAllTaskQueues() {
+				if err := temporalService.StartWorker(taskQueue); err != nil {
+					return fmt.Errorf("failed to start worker for task queue %s: %w", taskQueue.String(), err)
+				}
+			}
+
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			return temporalService.Stop(ctx)
+		},
+	})
+}
+
+func startAPIServer(
+	lc fx.Lifecycle,
+	r http.Handler,
+	cfg *config.Configuration,
+	log *logger.Logger,
+) {
+	log.Info(context.Background(), "Registering API server start hook")
+	srv := &http.Server{
+		Addr:    cfg.Server.Address,
+		Handler: r,
+	}
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			log.Info(ctx, "Starting API server...")
+			go func() {
+				if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Fatalf("Failed to start server: %v", err)
+				}
+			}()
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			timeout := cfg.Server.GetShutdownTimeout()
+			log.Info(ctx, "Shutting down server, draining in-flight requests", "timeout", timeout.String())
+
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+			defer cancel()
+
+			err := srv.Shutdown(shutdownCtx)
+			if err != nil {
+				// Shutdown leaves connections past the deadline running; sever them
+				// so later stop hooks do not tear down deps under live handlers.
+				log.Error(ctx, "server drain timed out, closing active connections", "error", err)
+				if closeErr := srv.Close(); closeErr != nil {
+					log.Error(ctx, "failed to close listener after drain timeout", "error", closeErr)
+				}
+			} else {
+				log.Info(ctx, "server drained, all in-flight requests completed")
+			}
+
+			log.Shutdown(ctx)
+			return err
+		},
+	})
+}
+
+func registerRouterHandlers(
+	router *pubsubRouter.Router,
+	webhookService *webhook.WebhookService,
+	integrationEventService *integrationevents.IntegrationEventService,
+	onboardingService service.OnboardingService,
+	eventConsumptionSvc service.EventConsumptionService,
+	costSheetUsageSvc service.CostSheetUsageTrackingService,
+	walletBalanceAlertSvc service.WalletBalanceAlertService,
+	rawEventConsumptionSvc service.RawEventConsumptionService,
+	meterUsageTrackingSvc service.MeterUsageTrackingService,
+	activityConsumer *activity.Consumer,
+	cfg *config.Configuration,
+	includeProcessingHandlers bool,
+) {
+	if includeProcessingHandlers {
+		onboardingService.RegisterHandler(router, cfg)
+		webhookService.RegisterHandler(router)
+		integrationEventService.RegisterHandler(router)
+		eventConsumptionSvc.RegisterHandler(router, cfg)
+		eventConsumptionSvc.RegisterHandlerLazy(router, cfg)
+		eventConsumptionSvc.RegisterHandlerReplay(router, cfg)
+		eventConsumptionSvc.RegisterBulkHandler(router, cfg)
+		walletBalanceAlertSvc.RegisterHandler(router, cfg)
+		rawEventConsumptionSvc.RegisterHandler(router, cfg)
+		meterUsageTrackingSvc.RegisterHandler(router, cfg)
+		meterUsageTrackingSvc.RegisterHandlerLazy(router, cfg)
+		meterUsageTrackingSvc.RegisterBulkHandler(router, cfg)
+		activityConsumer.RegisterHandler(router, cfg)
+	}
+}
+
+func startRouter(
+	lc fx.Lifecycle,
+	router *pubsubRouter.Router,
+	logger *logger.Logger,
+) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			logger.Info(ctx, "starting message router")
+			go func() {
+				if err := router.Run(); err != nil {
+					logger.Errorw("message router failed", "error", err)
+				}
+			}()
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			logger.Info(ctx, "stopping message router")
+			return router.Close()
+		},
+	})
+}
+
+func provideWalletBalanceAlertPubSub(
+	cfg *config.Configuration,
+	logger *logger.Logger,
+) types.WalletBalanceAlertPubSub {
+	pubSub, err := kafkaPubsub.NewPubSubFromConfig(
+		cfg,
+		logger,
+		cfg.WalletBalanceAlert.ConsumerGroup,
+	)
+	if err != nil {
+		logger.Fatalw("failed to create pubsub for wallet alerts", "error", err)
+		return types.WalletBalanceAlertPubSub{}
+	}
+	return types.WalletBalanceAlertPubSub{PubSub: pubSub}
+}
+
+func provideActivityPubSub(
+	cfg *config.Configuration,
+	logger *logger.Logger,
+) types.ActivityPubSub {
+	if !cfg.Activity.Enabled {
+		return types.ActivityPubSub{}
+	}
+	pubSub, err := kafkaPubsub.NewPubSubFromConfig(cfg, logger, cfg.Activity.ConsumerGroup)
+	if err != nil {
+		logger.Fatalw("failed to create pubsub for activity log", "error", err)
+		return types.ActivityPubSub{}
+	}
+	return types.ActivityPubSub{PubSub: pubSub}
+}
+
+// serviceParamsProviders build the ServiceParams every service consumes from the base params.
+// revenue.New and self-billing build from the base params, so the service layer never imports them.
+func serviceParamsProviders() fx.Option {
+	return fx.Provide(
+		fx.Annotate(revenue.New, fx.ParamTags(`name:"base"`)),
+		fx.Annotate(selfbilling.New, fx.ParamTags(`name:"base"`)),
+		fx.Annotate(enrichServiceParams, fx.ParamTags(`name:"base"`, ``, ``)),
+	)
+}
+
+// enrichServiceParams returns the ServiceParams the rest of the app consumes: the base params plus
+// the revenue-facts service the invoice hooks call and the self-billing hook.
+func enrichServiceParams(base service.ServiceParams, revenueFacts interfaces.RevenueService, selfBilling selfbilling.Service) service.ServiceParams {
+	base.RevenueFacts = revenueFacts
+	base.SelfBilling = selfBilling
+	return base
+}
